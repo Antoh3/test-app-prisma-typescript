@@ -1,0 +1,279 @@
+1. Prisma Models
+
+prisma
+
+model User {
+  id        String    @id @default(uuid())
+  email     String    @unique
+  password  String
+  role      Role      @default(PATIENT)
+  patient   Patient?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
+model Patient {
+  id        String       @id @default(uuid())
+  userId    String       @unique
+  user      User         @relation(fields: [userId], references: [id])
+  appointments Appointment[]
+
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+}
+
+model Appointment {
+  id        String    @id @default(uuid())
+  schedule  DateTime
+  reason    String
+  status    String    @default("pending")
+  patientId String
+  patient   Patient   @relation(fields: [patientId], references: [id])
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
+enum Role {
+  PATIENT
+  DOCTOR
+  ADMIN
+}
+
+2. JWT Authentication Setup
+
+Create a separate file for handling JWT.
+
+jwt.js:
+
+js
+
+const jwt = require('jsonwebtoken');
+
+const generateToken = (user) => {
+  return jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+};
+
+const verifyToken = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ message: 'Unauthorized access.' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    res.status(401).json({ message: 'Token invalid or expired.' });
+  }
+};
+
+module.exports = { generateToken, verifyToken };
+
+
+
+3. Controllers
+
+authController.js (Register & Login):
+
+js
+
+const bcrypt = require('bcryptjs');
+const prisma = require('../prisma/client'); // Assuming this is where Prisma client is initialized
+const { generateToken } = require('../utils/jwt');
+
+exports.register = async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Create user
+    const user = await prisma.user.create({
+      data: {
+        email,
+        password: hashedPassword,
+        patient: {
+          create: {},
+        },
+      },
+    });
+
+    // Generate JWT token
+    const token = generateToken(user);
+
+    res.status(201).json({ token, patientId: user.patient.id });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to register user.' });
+  }
+};
+
+exports.login = async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { email },
+      include: { patient: true },
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+
+    if (!isMatch) {
+      return res.status(400).json({ error: 'Invalid credentials.' });
+    }
+
+    const token = generateToken(user);
+    res.json({ token, patientId: user.patient.id });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to login.' });
+  }
+};
+
+
+
+
+appointmentController.js (Booking, Rescheduling, Deleting Appointments):
+
+js
+
+const prisma = require('../prisma/client'); // Assuming this is where Prisma client is initialized
+
+// Book Appointment
+exports.bookAppointment = async (req, res) => {
+  const { schedule, reason } = req.body;
+  const patientId = req.user.id;
+
+  try {
+    const appointment = await prisma.appointment.create({
+      data: {
+        schedule: new Date(schedule),
+        reason,
+        patient: {
+          connect: { id: patientId },
+        },
+      },
+    });
+    res.status(201).json(appointment);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to book appointment.' });
+  }
+};
+
+// Reschedule Appointment
+exports.rescheduleAppointment = async (req, res) => {
+  const { appointmentId } = req.params;
+  const { schedule, reason } = req.body;
+  const patientId = req.user.id;
+
+  try {
+    const appointment = await prisma.appointment.updateMany({
+      where: {
+        id: appointmentId,
+        patientId: patientId, // Ensure it's the logged-in user's appointment
+      },
+      data: {
+        schedule: new Date(schedule),
+        reason,
+      },
+    });
+
+    if (appointment.count === 0) {
+      return res.status(404).json({ error: 'Appointment not found.' });
+    }
+
+    res.json(appointment);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to reschedule appointment.' });
+  }
+};
+
+// Delete Appointment
+exports.deleteAppointment = async (req, res) => {
+  const { appointmentId } = req.params;
+  const patientId = req.user.id;
+
+  try {
+    const appointment = await prisma.appointment.deleteMany({
+      where: {
+        id: appointmentId,
+        patientId: patientId, // Ensure it's the logged-in user's appointment
+      },
+    });
+
+    if (appointment.count === 0) {
+      return res.status(404).json({ error: 'Appointment not found.' });
+    }
+
+    res.json({ message: 'Appointment deleted successfully.' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete appointment.' });
+  }
+};
+
+
+
+4. Routes
+
+authRoutes.js:
+
+js
+
+const express = require('express');
+const { register, login } = require('../controllers/authController');
+const router = express.Router();
+
+router.post('/register', register);
+router.post('/login', login);
+
+module.exports = router;
+
+
+
+appointmentRoutes.js:
+
+js
+
+const express = require('express');
+const {
+  bookAppointment,
+  rescheduleAppointment,
+  deleteAppointment,
+} = require('../controllers/appointmentController');
+const { verifyToken } = require('../utils/jwt');
+
+const router = express.Router();
+
+router.post('/book', verifyToken, bookAppointment);
+router.put('/reschedule/:appointmentId', verifyToken, rescheduleAppointment);
+router.delete('/delete/:appointmentId', verifyToken, deleteAppointment);
+
+module.exports = router;
+
+5. Server Setup (app.js):
+
+js
+
+const express = require('express');
+const authRoutes = require('./routes/authRoutes');
+const appointmentRoutes = require('./routes/appointmentRoutes');
+
+const app = express();
+
+app.use(express.json());
+
+app.use('/api/auth', authRoutes);
+app.use('/api/appointments', appointmentRoutes);
+
+const PORT = process.env.PORT || 5000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
